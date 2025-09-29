@@ -1,0 +1,172 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Serverless Contact Form App using CloudFormation
+
+Resources:
+
+  # DynamoDB Table
+  ContactsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Contacts
+      AttributeDefinitions:
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: timestamp
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  # IAM Role for Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ContactFormLambdaRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+        - arn:aws:iam::aws:policy/AmazonSESFullAccess
+
+  # Lambda Function
+  ContactLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ContactFormHandler
+      Handler: index.lambda_handler
+      Runtime: python3.12
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 10
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from datetime import datetime
+
+          dynamodb = boto3.resource("dynamodb")
+          table = dynamodb.Table("Contacts")
+          ses = boto3.client("ses")
+
+          FROM_EMAIL = "ottodemare1@gmail.com"
+          TO_EMAIL = "94ottdem@gafe.molndal.se"
+
+          def lambda_handler(event, context):
+              try:
+                  payload = json.loads(event["body"])
+                  timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                  table.put_item(Item={
+                      "timestamp": timestamp,
+                      "name": payload["name"],
+                      "email": payload["email"],
+                      "message": payload.get("msg", "")
+                  })
+
+                  ses.send_email(
+                      Source=FROM_EMAIL,
+                      Destination={"ToAddresses": [TO_EMAIL]},
+                      Message={
+                          "Subject": {"Data": "New Contact Form Submission"},
+                          "Body": {"Text": {"Data": json.dumps(payload, indent=2)}}
+                      }
+                  )
+
+                  return {
+                      "statusCode": 200,
+                      "headers": {
+                          "Access-Control-Allow-Origin": "*",
+                          "Access-Control-Allow-Headers": "*",
+                          "Access-Control-Allow-Methods": "OPTIONS,POST"
+                      },
+                      "body": json.dumps({"status": "success"})
+                  }
+              except Exception as e:
+                  return {
+                      "statusCode": 500,
+                      "body": json.dumps({"error": str(e)})
+                  }
+
+  # API Gateway
+  ContactApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: ContactFormApi
+
+  ContactApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ContactApi
+      ParentId: !GetAtt ContactApi.RootResourceId
+      PathPart: contact
+
+  ContactApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ContactApi
+      ResourceId: !Ref ContactApiResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: 
+          Fn::Sub: 
+            - arn:aws:apigateway:${Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+            - { Region: !Ref "AWS::Region", LambdaArn: !GetAtt ContactLambda.Arn }
+
+  # API Deployment
+  ContactApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref ContactApi
+      StageName: prod
+    DependsOn: ContactApiMethod
+
+  # Lambda Permission for API Gateway
+  LambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ContactLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: 
+        Fn::Sub: arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ContactApi}/*/POST/contact
+
+  # S3 Bucket for Frontend Hosting
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "contact-form-webapp-${AWS::AccountId}-${AWS::Region}"
+      WebsiteConfiguration:
+        IndexDocument: index.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+
+Outputs:
+  ApiUrl:
+    Value: !Sub "https://${ContactApi}.execute-api.${AWS::Region}.amazonaws.com/prod/contact"
+    Description: API endpoint for the Contact Form
+
+  WebsiteURL:
+    Value: !GetAtt FrontendBucket.WebsiteURL
+    Description: Static website hosting URL
